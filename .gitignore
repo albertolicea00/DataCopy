@@ -1,0 +1,33 @@
+# Generated build output
+/build/
+/out/
+/.vs/
+*.user
+*.pdb
+
+# Local workspaces and editor workspace files
+workspace/
+.workspace/
+.workspaces/
+.workscpace/
+*.code-workspace
+
+# Windows metadata
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+.TemporaryItems/
+.fseventsd/
+.DocumentRevisions-V100/
+.apdisk
