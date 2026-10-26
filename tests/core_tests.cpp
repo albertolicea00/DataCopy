@@ -130,6 +130,61 @@ void corruptCheckpoint() {
     require(rejected,"Corrupt checkpoint silently accepted");
     require(fs::file_size(f.state/L"session.dat")==6,"Corrupt checkpoint overwritten");
 }
+void persistenceFailureRejectsJob() {
+    Fixture f;write(f.source/L"data.bin",1024);Engine e(f.state);
+    HANDLE blocker=CreateFileW((f.state/L"session.tmp").c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,0,nullptr);
+    require(blocker!=INVALID_HANDLE_VALUE,"Could not lock checkpoint temporary file");
+    bool rejected=false;
+    try { e.enqueue({f.source/L"data.bin"},f.target); } catch(const std::exception&) { rejected=true; }
+    CloseHandle(blocker);
+    require(rejected,"Job accepted without durable session storage");
+    require(e.snapshot().jobs.empty(),"Rejected job left in queue");
+    require(!fs::exists(f.target/L"data.bin"),"Rejected job started copying");
+    require(!e.snapshot().storageError.empty(),"Session storage failure not visible");
+    auto id=e.enqueue({f.source/L"data.bin"},f.target);
+    require(job(e,id).state==State::Paused,"Queue resumed without consent after a storage failure");
+    e.resumeAll();require(finished(e,id).state==State::Done,"Queue did not recover after storage was fixed");
+}
+void persistenceFailurePausesQueue() {
+    Fixture f;write(f.source/L"data.bin",12*1024*1024);Engine e(f.state);e.setNight(true);
+    auto id=e.enqueue({f.source/L"data.bin"},f.target);
+    wait(e,id,[](const Job& j){return j.completed>=1024*1024;});
+    HANDLE blocker=CreateFileW((f.state/L"session.tmp").c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,0,nullptr);
+    require(blocker!=INVALID_HANDLE_VALUE,"Could not lock checkpoint temporary file");
+    e.setNight(true);
+    auto snapshot=e.snapshot();CloseHandle(blocker);
+    require(snapshot.recovery && job(e,id).state==State::Paused,"Storage failure did not pause active transfer");
+    require(!fs::exists(f.target/L"data.bin"),"Transfer finalized despite lost persistence");
+    e.setNight(false);e.resumeAll();require(finished(e,id).state==State::Done,"Paused job could not recover");
+    require(equal(f.source/L"data.bin",f.target/L"data.bin"),"Recovered storage-failure copy differs");
+}
+void vanishedSourceDoesNotAbortBatch() {
+    Fixture f;write(f.source/L"busy.bin",32*1024*1024);write(f.source/L"gone.bin",100);write(f.source/L"kept.bin",200);
+    Engine e(f.state);e.setNight(true);auto first=e.enqueue({f.source/L"busy.bin"},f.target);
+    wait(e,first,[](const Job& j){return j.completed>=1024*1024;});
+    auto second=e.enqueue({f.source/L"gone.bin",f.source/L"kept.bin"},f.target);
+    fs::remove(f.source/L"gone.bin");
+    auto result=finished(e,second);
+    require(result.state==State::Errors && result.errors==1,"Missing source was not reported");
+    require(equal(f.source/L"kept.bin",f.target/L"kept.bin"),"Missing source aborted the remaining batch");
+}
+void malformedCheckpointBoolean() {
+    Fixture f;{Engine e(f.state);e.shutdown();}
+    auto session=f.state/L"session.dat";
+    auto size=fs::file_size(session);
+    {std::fstream out(session,std::ios::binary|std::ios::in|std::ios::out);out.seekp(sizeof(unsigned)+sizeof(u64));out.put('\x02');}
+    bool rejected=false;try {Engine e(f.state);} catch(const std::exception&) {rejected=true;}
+    require(rejected,"Malformed boolean in a valid session header accepted");
+    require(fs::file_size(session)==size,"Malformed session was overwritten");
+}
+void normalizedVolumeRoot() {
+    Fixture f;wchar_t root[32768]{};
+    require(GetVolumePathNameW(f.source.c_str(),root,32768)!=FALSE,"Could not locate fixture volume root");
+    auto location=bind(fs::path(root));auto resolved=resolve(location);
+    require(!resolved.empty() && fs::is_directory(resolved),"Volume root could not be resolved");
+    for(const auto& part:resolved) require(part!=L"." && part!=L"..","Extended-length volume path contains dot segments");
+    require(fs::equivalent(resolved,fs::path(root)),"Resolved volume root changed identity");
+}
 }
 int main() {
     unsigned failed=0;
@@ -138,7 +193,12 @@ int main() {
         {"identical destination verified",duplicateIdentical},{"explicit recovery and corrupt partial",recoverCorruptPartial},
         {"large file and unaligned tail",directTail},{"changed source rejected",changedSource},
         {"single worker and cancellation",cancelAndSingleWorker},{"recursive target rejected",rejectNestedTarget},
-        {"corrupt checkpoint preserved",corruptCheckpoint}
+        {"corrupt checkpoint preserved",corruptCheckpoint},
+        {"job rejected when checkpoint cannot be saved",persistenceFailureRejectsJob},
+        {"active queue paused on persistence failure",persistenceFailurePausesQueue},
+        {"vanished source does not abort batch",vanishedSourceDoesNotAbortBatch},
+        {"malformed checkpoint boolean preserved",malformedCheckpointBoolean},
+        {"volume root path normalized",normalizedVolumeRoot}
     };
     for(auto [name,test]:tests) {
         try {test();std::cout<<"PASS "<<name<<'\n';}

@@ -7,6 +7,9 @@
 #include <sstream>
 #include <cwctype>
 #include <cstring>
+#include <type_traits>
+#include <set>
+#include <limits>
 
 namespace dc {
 namespace {
@@ -28,7 +31,15 @@ u64 modified(const fs::path& path) {
 }
 template<class T> void put(std::ostream& out, T n) { out.write(reinterpret_cast<const char*>(&n), sizeof(n)); }
 template<class T> T get(std::istream& in) {
-    T n{}; in.read(reinterpret_cast<char*>(&n), sizeof(n)); if (!in) throw std::runtime_error("Incomplete checkpoint"); return n;
+    if constexpr(std::is_same_v<T,bool>) {
+        unsigned char value=0; in.read(reinterpret_cast<char*>(&value),1);
+        if(!in || value>1) throw std::runtime_error("Invalid checkpoint boolean");
+        return value!=0;
+    } else {
+        T n{}; in.read(reinterpret_cast<char*>(&n), sizeof(n));
+        if(!in) throw std::runtime_error("Incomplete checkpoint");
+        return n;
+    }
 }
 void putString(std::ostream& out, const std::wstring& s) {
     put(out, static_cast<unsigned>(s.size())); out.write(reinterpret_cast<const char*>(s.data()), s.size() * sizeof(wchar_t));
@@ -130,7 +141,12 @@ u64 Engine::enqueue(const std::vector<fs::path>& paths,const fs::path& destinati
     job.name=paths.front().filename().wstring(); if(paths.size()>1) job.name+=L" + "+std::to_wstring(paths.size()-1);
     std::lock_guard lock(mutex_); job.id=nextId_++; auto id=job.id;
     if(recovery_) job.state=State::Paused;
-    jobs_.push_back(std::move(job)); save(); wake_.notify_all(); return id;
+    jobs_.push_back(std::move(job));
+    if(!save()) {
+        jobs_.pop_back();
+        throw std::runtime_error("Could not save the batch. Check free space and permissions for the data folder.");
+    }
+    wake_.notify_all(); return id;
 }
 void Engine::pause(u64 id) {
     std::lock_guard lock(mutex_); auto& j=find(id);
@@ -171,7 +187,7 @@ void Engine::log(u64 id,const std::wstring& message) {
     { std::lock_guard lock(mutex_); log_.push_back(line); if(log_.size()>250) log_.erase(log_.begin()); }
     std::ofstream out(directory_/L"events.log",std::ios::app|std::ios::binary); out<<utf8(line)<<"\n";
 }
-void Engine::save() {
+bool Engine::save() {
     try {
         auto tmp=directory_/L"session.tmp";
         std::ofstream out(tmp,std::ios::binary|std::ios::trunc);
@@ -192,17 +208,27 @@ void Engine::save() {
         check(static_cast<BOOL>(static_cast<bool>(h))); check(FlushFileBuffers(h)); h.close();
         check(MoveFileExW(tmp.c_str(),(directory_/L"session.dat").c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH));
         storageError_.clear();
-    } catch(const std::exception& e) { auto s=std::string(e.what()); storageError_=L"Could not save the session: "+std::wstring(s.begin(),s.end()); }
+        return true;
+    } catch(const std::exception& e) {
+        auto s=std::string(e.what()); storageError_=L"Could not save the session: "+std::wstring(s.begin(),s.end());
+        recovery_=true;
+        for(auto& j:jobs_) if(!terminal(j.state)) {
+            j.state=State::Paused; j.speed=0; j.detail=L"Paused: recovery could not be saved. Check the data folder before resuming.";
+        }
+        return false;
+    }
 }
 void Engine::load() {
     auto file=directory_/L"session.dat"; if(!fs::exists(file)) return;
     try {
         std::ifstream in(file,std::ios::binary); if(get<unsigned>(in)!=0x44435031u) throw std::runtime_error("Unknown checkpoint version");
         nextId_=get<u64>(in); night_=get<bool>(in); auto count=get<unsigned>(in);
-        if(count>100000) throw std::runtime_error("Too many batches");
+        if(count>100000 || !nextId_) throw std::runtime_error("Invalid session header");
         std::vector<Job> loaded;
+        std::set<u64> ids;
         for(unsigned i=0;i<count;++i) {
             Job j; j.id=get<u64>(in); j.name=getString(in); j.target=getLocation(in);
+            if(!j.id || j.id>=nextId_ || !ids.insert(j.id).second) throw std::runtime_error("Invalid batch ID");
             auto state=get<unsigned>(in); if(state>static_cast<unsigned>(State::Cancelled)) throw std::runtime_error("Invalid state");
             j.state=static_cast<State>(state); j.scanned=get<bool>(in); j.total=get<u64>(in); j.completed=get<u64>(in);
             j.skipped=get<u64>(in); j.errors=get<unsigned>(in);
@@ -211,14 +237,22 @@ void Engine::load() {
             n=get<unsigned>(in); if(n>5000000) throw std::runtime_error("Too many folders");
             for(unsigned k=0;k<n;++k) { auto rel=getString(in); safeRelative(rel); j.directories.push_back(rel); }
             n=get<unsigned>(in); if(n>5000000) throw std::runtime_error("Too many files");
+            u64 total=0,completed=0,skipped=0;
             for(unsigned k=0;k<n;++k) {
                 File f; f.source=getLocation(in); f.relative=getString(in); safeRelative(f.relative);
                 f.size=get<u64>(in); f.modified=get<u64>(in); f.offset=get<u64>(in); f.done=get<bool>(in); f.skipped=get<bool>(in);
-                if(f.offset>f.size) throw std::runtime_error("Invalid offset"); j.files.push_back(f);
+                if(f.offset>f.size || (f.done && (f.offset!=f.size || f.skipped)) || (f.skipped && f.offset))
+                    throw std::runtime_error("Invalid file offset or state");
+                if(f.size>std::numeric_limits<u64>::max()-total) throw std::runtime_error("Invalid batch size");
+                total+=f.size;completed+=f.offset;if(f.skipped) skipped+=f.size;
+                j.files.push_back(f);
             }
+            if(total!=j.total || completed!=j.completed || skipped!=j.skipped || (!j.scanned && (n || !j.directories.empty())))
+                throw std::runtime_error("Inconsistent session counters");
             if(!terminal(j.state)) { j.state=State::Interrupted; recovery_=true; }
             loaded.push_back(std::move(j));
         }
+        if(in.peek()!=std::char_traits<char>::eof()) throw std::runtime_error("Unexpected data at the end of the session");
         jobs_=std::move(loaded);
     } catch(const std::exception&) {
         // Keep the original for diagnosis; never overwrite a damaged checkpoint automatically.
@@ -264,21 +298,30 @@ void Engine::scan(u64 id) {
     Job local;
     { std::lock_guard lock(mutex_); local=find(id); }
     local.files.clear(); local.directories.clear(); local.total=0; local.errors=0;
-    auto addFile=[&](const fs::path& path,const fs::path& relative) {
+    auto addFile=[&](const fs::path& path,const fs::path& relative,const Location& origin) {
         if(interrupted(id)) return;
         try {
             rejectReparse(path); File f; f.source=bind(path); f.relative=relative.wstring();
             f.size=fs::file_size(path); f.modified=modified(path); local.total+=f.size; local.files.push_back(f);
         } catch(const std::exception& e) {
+            if(deviceError(e) || resolve(local.target).empty() || resolve(origin).empty()) throw;
             ++local.errors; auto s=std::string(e.what()); log(id,L"Skipped due to an error: "+path.wstring()+L" · "+std::wstring(s.begin(),s.end()));
         }
     };
     for(auto& source:local.sources) {
         if(interrupted(id)) return;
         auto root=resolve(source); if(root.empty()) throw std::runtime_error("Device disconnected during scanning");
+        try { rejectReparse(root); }
+        catch(const std::exception&) { ++local.errors;log(id,L"Source skipped: the path now contains a symbolic link or junction.");continue; }
         auto top=fs::path(source.relative).filename();
-        if(fs::is_regular_file(root)) { addFile(root,top); continue; }
-        if(!fs::is_directory(root)) throw std::runtime_error("The source no longer exists");
+        std::error_code rootError;
+        auto status=fs::status(root,rootError);
+        if(rootError || !fs::exists(status)) {
+            if(resolve(source).empty()) throw std::runtime_error("Device disconnected during scanning");
+            ++local.errors; log(id,L"Source skipped (inaccessible or no longer present): "+source.relative); continue;
+        }
+        if(fs::is_regular_file(status)) { addFile(root,top,source); continue; }
+        if(!fs::is_directory(status)) { ++local.errors; log(id,L"Unsupported source: "+source.relative); continue; }
         local.directories.push_back(top.wstring());
         // Explicit traversal logs unreadable directories instead of silently omitting them.
         std::vector<fs::path> pending{root};
@@ -296,12 +339,13 @@ void Engine::scan(u64 id) {
                     ++local.errors; log(id,L"Skipped (link or inaccessible): "+p.wstring());
                 } else {
                     if(attr&FILE_ATTRIBUTE_DIRECTORY) { local.directories.push_back(relative.wstring()); pending.push_back(p); }
-                    else addFile(p,relative);
+                    else addFile(p,relative,source);
                 }
                 it.increment(ec);
                 if(ec) { ++local.errors; log(id,L"Error enumerating: "+dir.wstring()); break; }
             }
         }
+        if(resolve(source).empty() || resolve(local.target).empty()) throw std::runtime_error("Device disconnected during scanning");
     }
     std::lock_guard lock(mutex_); auto& j=find(id);
     if(j.state==State::Paused || j.state==State::Cancelled || stop_) return;
@@ -313,10 +357,10 @@ void Engine::process(u64 id) {
     { std::lock_guard lock(mutex_); scanned=find(id).scanned; }
     if(!scanned) {
         try { scan(id); }
-        catch(const std::exception&) {
+        catch(const std::exception& error) {
             bool missing=false;
             { std::lock_guard lock(mutex_); auto& j=find(id);
-              missing=resolve(j.target).empty(); for(auto& s:j.sources) missing=missing || resolve(s).empty();
+              missing=deviceError(error) || resolve(j.target).empty(); for(auto& s:j.sources) missing=missing || resolve(s).empty();
               if(missing && !terminal(j.state) && j.state!=State::Paused) { j.state=State::Waiting; j.speed=0; save(); } }
             if(missing) { log(id,L"Scanning stopped: waiting for device."); return; }
             throw;
@@ -352,7 +396,9 @@ void Engine::process(u64 id) {
     }
     if(interrupted(id)) return;
     std::wstring message;
-    { std::lock_guard lock(mutex_); auto& j=find(id); j.state=j.errors?State::Errors:State::Done;
+    { std::lock_guard lock(mutex_); auto& j=find(id);
+      if(stop_ || j.state==State::Paused || j.state==State::Cancelled || j.state==State::Interrupted) return;
+      j.state=j.errors?State::Errors:State::Done;
       j.speed=0; j.current.clear(); message=j.target.label+L": "+j.name+L" · "+bytes(j.completed);
       if(j.errors) message+=L" · "+std::to_wstring(j.errors)+L" errors (see log)";
       save(); }

@@ -84,7 +84,7 @@ fs::path resolve(const Location& location) {
     wchar_t mounts[32768]{}; DWORD count = 0;
     if (!GetVolumePathNamesForVolumeNameW(location.volume.c_str(), mounts, 32768, &count) || !mounts[0]) return {};
     if (GetFileAttributesW(location.volume.c_str()) == INVALID_FILE_ATTRIBUTES) return {};
-    return fs::path(location.volume) / location.relative;
+    return (fs::path(location.volume) / location.relative).lexically_normal();
 }
 bool safeEject(const Volume& v, std::wstring& error) {
     if (!v.removable) { error = L"Ejection is only available for USB or removable devices."; return false; }

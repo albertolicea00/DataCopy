@@ -96,7 +96,7 @@ private:
     void copy(u64 id, size_t index);
     bool interrupted(u64 id);
     Job& find(u64 id);
-    void save(); // mutex held
+    bool save(); // mutex held; pause the queue if recovery cannot be persisted
     void load();
     void log(u64 id, const std::wstring& message);
     void metric(const Job& job, const File& file, u64 transferred, double seconds, const std::wstring& event);
