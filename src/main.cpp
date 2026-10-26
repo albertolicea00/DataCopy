@@ -117,7 +117,7 @@ void refreshDevices() {
 }
 void receiveDevices() {
     if(!inventory.valid() || inventory.wait_for(std::chrono::seconds(0))!=std::future_status::ready) return;
-    try { devices=inventory.get(); }
+    try { devices=inventory.get(); cardRects.clear(); }
     catch(const std::exception&) { return; }
     selectedDevice=-1;
     for(size_t i=0;i<devices.size();++i) if(devices[i].id==selectedVolumeId) selectedDevice=static_cast<int>(i);
@@ -443,7 +443,7 @@ LRESULT CALLBACK procedure(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
     }
     case WM_LBUTTONDOWN: {
         POINT p{MulDiv(GET_X_LPARAM(l),96,dpi),MulDiv(GET_Y_LPARAM(l),96,dpi)};
-        for(size_t i=0;i<cardRects.size();++i) if(PtInRect(&cardRects[i],p)) {
+        for(size_t i=0;i<cardRects.size() && i<devices.size();++i) if(PtInRect(&cardRects[i],p)) {
             selectedDevice=static_cast<int>(i);selectedVolumeId=devices[i].id;selectedTarget=devices[i].id;
             SetWindowTextW(targetText,(L"Destination: "+devices[i].label+L" · volume root").c_str()); InvalidateRect(hwnd,nullptr,FALSE); break;
         } return 0;
@@ -457,7 +457,7 @@ LRESULT CALLBACK procedure(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
             DragQueryFileW(drop,i,path.data(),n+1);path.resize(n);paths.emplace_back(path);
         }
         DragFinish(drop);
-        for(size_t i=0;i<cardRects.size();++i) if(PtInRect(&cardRects[i],point)) {
+        for(size_t i=0;i<cardRects.size() && i<devices.size();++i) if(PtInRect(&cardRects[i],point)) {
             selectedDevice=static_cast<int>(i); selectedVolumeId=devices[i].id; selectedTarget=devices[i].id;
             SetWindowTextW(targetText,(L"Destination: "+devices[i].label+L" · volume root").c_str()); break;
         }
@@ -475,8 +475,13 @@ LRESULT CALLBACK procedure(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
         tray.uFlags=NIF_INFO;tray.dwInfoFlags=NIIF_INFO;wcscpy_s(tray.szInfoTitle,L"DataCopy · Batch completed");
         wcsncpy_s(tray.szInfo,messageText->c_str(),_TRUNCATE);Shell_NotifyIconW(NIM_MODIFY,&tray);return 0;
     }
-    case WM_CLOSE:
-        KillTimer(hwnd,1);KillTimer(hwnd,2);engine->shutdown(); DestroyWindow(hwnd);return 0;
+    case WM_CLOSE: {
+        KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);engine->shutdown();
+        MSG pending{};
+        while(PeekMessageW(&pending,hwnd,finishedMessage,finishedMessage,PM_REMOVE))
+            delete reinterpret_cast<std::wstring*>(pending.lParam);
+        DestroyWindow(hwnd);return 0;
+    }
     case WM_DESTROY:
         Shell_NotifyIconW(NIM_DELETE,&tray);DeleteObject(font);DeleteObject(titleFont);DeleteObject(smallFont);DeleteObject(paintFont);DeleteObject(paintSmallFont);PostQuitMessage(0);return 0;
     }
@@ -510,6 +515,10 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
             if(!IsDialogMessageW(hwnd,&message)) {TranslateMessage(&message);DispatchMessageW(&message);}
         }
         engine.reset();
-    } catch(const std::exception& e) { MessageBoxW(nullptr,fromException(e).c_str(),L"DataCopy · Error",MB_OK|MB_ICONERROR); }
+    } catch(const std::exception& e) {
+        if(engine) engine->shutdown();
+        MessageBoxW(nullptr,fromException(e).c_str(),L"DataCopy · Error",MB_OK|MB_ICONERROR);
+        engine.reset();CloseHandle(instanceMutex);CoUninitialize();return 1;
+    }
     CloseHandle(instanceMutex);CoUninitialize();return 0;
 }
