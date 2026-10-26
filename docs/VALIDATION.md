@@ -13,6 +13,7 @@ queries were executed against an in-memory database using Windows-provided
 `winsqlite3.dll` and a sample copy event. These checks do not validate the C++
 transfer engine.
 
+The command launcher has also been checked for missing-tool detection and rejection of unsupported build configurations. It returns exit code 2 without downloading dependencies or changing system policies.
 
 ## Integration suite
 
@@ -30,7 +31,11 @@ Coverage includes:
 7. One active worker, cancellation, and continuation of the queue.
 8. Rejecting a destination folder nested inside the source.
 9. Preserving an unreadable checkpoint without overwriting it.
-
+10. Rejecting new batches when the session cannot be saved.
+11. Pausing the active queue when recovery storage fails.
+12. Continuing a batch when one source disappears while queued.
+13. Rejecting invalid booleans in an otherwise valid session header.
+14. Normalizing volume roots without dot segments in extended-length paths.
 
 ## Pending checks with physical devices
 

@@ -36,12 +36,12 @@ Install Visual Studio's Desktop development with C++ workload, Windows SDK, and
 CMake. From the repository root:
 
 ```powershell
-.\build.ps1
+.\build.cmd
 .\build\Release\DataCopy.exe
 ```
 
 The build launcher also runs the integration suite through CTest.
-Run `build.ps1` only where PowerShell execution policy permits it, or use the manual CMake commands in the setup guide.
+`build.cmd` does not depend on PowerShell script execution policy. `build.ps1` is also available where that policy permits it.
 
 ## Usage
 

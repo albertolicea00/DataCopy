@@ -26,7 +26,7 @@ Reference repositories or installers are not runtime or build dependencies.
 Run the build launcher from the repository root:
 
 ```powershell
-.\build.ps1
+.\build.cmd
 ```
 
 Alternatively, open **Developer PowerShell for Visual Studio** at the repository
@@ -39,7 +39,7 @@ ctest --test-dir build -C Release --output-on-failure
 .\build\Release\DataCopy.exe
 ```
 
-Run `build.ps1` only where PowerShell execution policy permits it, or use the manual CMake commands below.
+`build.cmd` does not depend on PowerShell script execution policy. `build.ps1` is also available where that policy permits it.
 
 ## SQLite
 
